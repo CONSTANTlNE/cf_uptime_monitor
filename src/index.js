@@ -126,6 +126,21 @@ async function sendTelegramMessage(config, text) {
   );
 }
 
+// ─── Health JSON Parser ──────────────────────────────────────────────────────
+
+function parseHealthJson(body) {
+  const checks = {};
+  for (const [key, val] of Object.entries(body)) {
+    if (key === 'status' || typeof val === 'number') continue;
+    if (typeof val !== 'string') continue;
+    if (val === 'ok') checks[key] = { state: 'ok' };
+    else if (val === 'fail') checks[key] = { state: 'fail' };
+    else if (val.startsWith('warn:')) checks[key] = { state: 'warn', detail: val.slice(5) };
+    else checks[key] = { state: 'unknown', detail: val };
+  }
+  return checks;
+}
+
 // ─── Scheduled Checks ────────────────────────────────────────────────────────
 
 async function runChecks(env) {
@@ -146,18 +161,52 @@ async function runChecks(env) {
       // Skip if checked more recently than the monitor's interval
       if (now - (prevStatus?.lastCheck ?? 0) < monitor.interval * 1000) return;
 
+      // Append secret as query param if configured.
+      // '__bot_token__' is a special marker — resolved from KV at runtime so
+      // the token value is never stored in the monitor object itself.
+      let fetchUrl = monitor.url;
+      if (monitor.secret) {
+        try {
+          let secretValue = monitor.secret;
+          if (secretValue === '__bot_token__') {
+            const tgConfig = await getTelegramConfig(env.KV);
+            secretValue = tgConfig?.botToken ?? '';
+          }
+          if (secretValue) {
+            const u = new URL(monitor.url);
+            u.searchParams.set('secret', secretValue);
+            fetchUrl = u.toString();
+          }
+        } catch { /* malformed URL, use as-is */ }
+      }
+
       const start = Date.now();
       let newStatusVal = 'down';
       let responseTime = 0;
+      let checkResults = null;
 
       try {
-        const res = await fetch(monitor.url, {
+        const res = await fetch(fetchUrl, {
           signal: AbortSignal.timeout(10_000),
           redirect: 'follow',
           headers: { 'User-Agent': 'UptimeMonitor/1.0' },
         });
         responseTime = Date.now() - start;
-        newStatusVal = res.status < 400 ? 'up' : 'down';
+        if (res.status >= 400) {
+          newStatusVal = 'down';
+        } else if (monitor.type === 'custom') {
+          try {
+            const body = await res.json();
+            checkResults = parseHealthJson(body);
+            const hasFail = body.status === 'fail' ||
+              Object.values(checkResults).some(c => c.state === 'fail');
+            newStatusVal = hasFail ? 'down' : 'up';
+          } catch {
+            newStatusVal = 'up'; // HTTP ok but not JSON — treat as simple up
+          }
+        } else {
+          newStatusVal = 'up';
+        }
       } catch {
         responseTime = Date.now() - start;
         newStatusVal = 'down';
@@ -169,11 +218,29 @@ async function runChecks(env) {
       // since = timestamp when current status started; reset on state change
       const since = statusChanged ? now : (prevStatus?.since ?? now);
 
+      // Alert count tracks how many down-alerts have fired for this incident.
+      // Resets to 0 on any state change. Caps reminder alerts at 5 total.
+      const prevAlertCount = statusChanged ? 0 : (prevStatus?.alertCount ?? 0);
+      const prevLastAlertAt = statusChanged ? 0 : (prevStatus?.lastAlertAt ?? 0);
+
+      const stillDownReminder = !statusChanged &&
+        newStatusVal === 'down' &&
+        prevAlertCount < 5 &&
+        (now - prevLastAlertAt) >= 60_000;
+
+      const shouldAlert = statusChanged || stillDownReminder;
+      const newAlertCount = newStatusVal === 'down'
+        ? (shouldAlert ? prevAlertCount + 1 : prevAlertCount)
+        : 0;
+
       const newStatusObj = {
         status: newStatusVal,
         since,
         lastCheck: now,
         lastResponseTime: responseTime,
+        alertCount: newAlertCount,
+        lastAlertAt: shouldAlert ? now : prevLastAlertAt,
+        ...(checkResults ? { checks: checkResults } : {}),
       };
 
       const history = await getHistory(env.KV, id);
@@ -185,19 +252,35 @@ async function runChecks(env) {
         env.KV.put(`history:${id}`, JSON.stringify(history)),
       ]);
 
-      if (statusChanged) {
+      if (shouldAlert) {
         const config = await getTelegramConfig(env.KV);
         if (config?.botToken && config.chatIds.length) {
           const utc = new Date(now).toUTCString();
+          const checks = checkResults ?? prevStatus?.checks ?? null;
           let msg;
-          if (newStatusVal === 'down') {
+
+          if (statusChanged && newStatusVal === 'down') {
             msg = `🔴 ${monitor.name} is DOWN\n${monitor.url}\nAt: ${utc}`;
+          } else if (stillDownReminder) {
+            const sec = Math.floor((now - since) / 1000);
+            const m = Math.floor(sec / 60);
+            const s = sec % 60;
+            msg = `🔴 ${monitor.name} is STILL DOWN (${newAlertCount}/5)\n${monitor.url}\nDown for: ${m}m ${s}s`;
           } else {
+            // Recovery
             const sec = Math.floor((now - (prevStatus?.since ?? now)) / 1000);
             const m = Math.floor(sec / 60);
             const s = sec % 60;
             msg = `🟢 ${monitor.name} recovered\n${monitor.url}\nDowntime: ${m}m ${s}s`;
           }
+
+          if (checks && Object.keys(checks).length) {
+            msg += '\n\n' + Object.entries(checks).map(([k, v]) => {
+              const icon = v.state === 'ok' ? '✅' : v.state === 'warn' ? '⚠️' : '❌';
+              return `${icon} ${k}${v.detail ? ' · ' + v.detail : ''}`;
+            }).join('\n');
+          }
+
           await sendTelegramMessage(config, msg);
         }
       }
@@ -239,12 +322,16 @@ async function apiListMonitors(env) {
       if (!monitor) return null;
       const upCount = history.filter((h) => h.status === 'up').length;
       const uptime = history.length ? (upCount / history.length) * 100 : null;
+      const { secret: _secret, ...monitorPublic } = monitor;
       return {
-        ...monitor,
+        ...monitorPublic,
+        hasSecret: !!monitor.secret,
+        secretType: monitor.secret === '__bot_token__' ? 'token' : (monitor.secret ? 'custom' : 'none'),
         status: monitor.enabled ? (status?.status ?? 'unknown') : 'paused',
         since: status?.since,
         lastCheck: status?.lastCheck,
         lastResponseTime: status?.lastResponseTime,
+        checks: status?.checks ?? null,
         uptime,
         history,
       };
@@ -274,12 +361,16 @@ async function apiAddMonitor(request, env) {
   }
 
   const interval = Math.max(30, Math.round(Number(body.interval) || 60));
+  const type = body.type === 'custom' ? 'custom' : 'simple';
+  const secret = String(body.secret ?? '').trim().slice(0, 200);
   const id = crypto.randomUUID();
   const monitor = {
     id,
     name: String(body.name).trim().slice(0, 100),
     url: parsed.toString(),
     interval,
+    type,
+    secret,
     enabled: true,
     createdAt: Date.now(),
   };
@@ -433,6 +524,26 @@ tr:hover td{background:var(--surface2)}
 .pg{color:var(--muted);font-size:13px}
 .pg:hover{color:var(--text);text-decoration:none}
 .err-msg{font-size:13px;color:var(--red);margin-bottom:10px;display:none}
+.type-badge{display:inline-block;font-size:10px;padding:1px 6px;border-radius:3px;background:#3b82f618;color:#3b82f6;margin-left:7px;vertical-align:middle;letter-spacing:.3px;font-weight:500}
+.checks{margin-top:6px;display:flex;flex-wrap:wrap;gap:3px}
+.chk{font-size:11px;padding:2px 6px;border-radius:3px;white-space:nowrap}
+.chk-ok{background:#22c55e18;color:#22c55e}
+.chk-fail{background:#ef444418;color:#ef4444}
+.chk-warn{background:#eab30818;color:#d97706}
+.chk-unknown{background:#77777718;color:#888}
+@media(max-width:640px){
+  .wrap{padding:16px 12px}
+  .hdr{padding:10px 14px}
+  .summary{flex-wrap:wrap}
+  .stat{min-width:calc(50% - 6px)}
+  .form-row{flex-direction:column}
+  .fg,.fg0{min-width:100%}
+  .fg0 select{width:100%}
+  .tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .mu{max-width:120px}
+  .acts{flex-direction:column;gap:4px}
+  .acts button{width:100%;font-size:13px;padding:7px 10px}
+}
 `;
 
 // ─── HTML Templates ───────────────────────────────────────────────────────────
@@ -515,22 +626,26 @@ function dashboardPage() {
   </div>
 
   <div class="card">
+    <div class="tbl-wrap">
     <table>
       <thead>
         <tr>
           <th>Monitor</th>
           <th>Status</th>
+          <th>Type</th>
+          <th>Interval</th>
           <th>Uptime</th>
           <th>Response</th>
           <th style="width:88px">Last 24</th>
           <th>Checked</th>
-          <th style="width:140px"></th>
+          <th style="width:160px"></th>
         </tr>
       </thead>
       <tbody id="rows">
-        <tr><td colspan="7" class="empty">Loading…</td></tr>
+        <tr><td colspan="9" class="empty">Loading…</td></tr>
       </tbody>
     </table>
+    </div>
   </div>
 
   <div class="add-card">
@@ -549,6 +664,22 @@ function dashboardPage() {
           <option value="1800">30 min</option>
           <option value="3600">1 hour</option>
         </select>
+      </div>
+      <div class="fg0"><label>Type</label>
+        <select id="newType" style="width:auto">
+          <option value="simple" selected>Simple</option>
+          <option value="custom">Custom Health JSON</option>
+        </select>
+      </div>
+      <div class="fg0"><label>Secret <span style="cursor:help;color:var(--muted)" title="Appended as ?secret=VALUE to every request">ⓘ</span></label>
+        <div style="display:flex;gap:6px;align-items:center">
+          <select id="newSecretType" style="width:auto">
+            <option value="">None</option>
+            <option value="__bot_token__">Bot Token</option>
+            <option value="custom">Custom…</option>
+          </select>
+          <input id="newSecret" type="password" placeholder="value" style="width:100px;display:none" autocomplete="off">
+        </div>
       </div>
       <div class="fg0" style="padding-top:16px"><button class="btn-primary" id="addBtn">Add Monitor</button></div>
     </div>
@@ -580,15 +711,36 @@ function sparkline(history){
   const color=last&&last.status==='down'?'#ef4444':'#22c55e';
   return '<svg width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'"><polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/></svg>';
 }
+function renderChecks(checks){
+  if(!checks)return'';
+  return'<div class="checks">'+Object.entries(checks).map(([k,v])=>{
+    const icon=v.state==='ok'?'✅':v.state==='warn'?'⚠️':'❌';
+    const detail=v.detail?' · '+esc(v.detail):'';
+    return'<span class="chk chk-'+v.state+'">'+icon+' '+esc(k)+detail+'</span>';
+  }).join('')+'</div>';
+}
+function fmtInterval(s){
+  if(s<60)return'~'+s+'s';
+  if(s<3600)return(s/60)+'m';
+  return(s/3600)+'h';
+}
 function renderRow(m){
   const st=m.status||'unknown';
   const stLabel=st.charAt(0).toUpperCase()+st.slice(1);
   const uptime=m.uptime!=null?m.uptime.toFixed(1)+'%':'—';
   const rt=m.lastResponseTime?m.lastResponseTime+'ms':'—';
   const toggleLabel=m.enabled?'Pause':'Resume';
+  const lockLabel=m.secretType==='token'?'🔒 token':m.secretType==='custom'?'🔒 secret':'';
+  const lockBadge=lockLabel?'<span class="type-badge" style="background:#77777712;color:var(--muted)">'+lockLabel+'</span>':'';
+  const typeCell=m.type==='custom'
+    ?'<span class="type-badge" style="margin-left:0">Custom</span>'
+    :'<span style="color:var(--muted);font-size:12px">Simple</span>';
+  const intervalCell='<span style="color:var(--muted);font-size:12px">'+fmtInterval(m.interval||60)+'</span>';
   return'<tr>'+
-    '<td><div class="mn">'+esc(m.name)+'</div><div class="mu">'+esc(m.url)+'</div></td>'+
-    '<td><span class="badge '+st+'"><span class="dot"></span><span class="lbl2">'+stLabel+'</span></span></td>'+
+    '<td><div class="mn">'+esc(m.name)+lockBadge+'</div><div class="mu">'+esc(m.url)+'</div></td>'+
+    '<td><span class="badge '+st+'"><span class="dot"></span><span class="lbl2">'+stLabel+'</span></span>'+(m.type==='custom'?renderChecks(m.checks):'')+'</td>'+
+    '<td>'+typeCell+'</td>'+
+    '<td>'+intervalCell+'</td>'+
     '<td>'+uptime+'</td>'+
     '<td>'+rt+'</td>'+
     '<td>'+sparkline(m.history)+'</td>'+
@@ -606,7 +758,7 @@ async function load(){
   const data=await r.json();
   const tbody=document.getElementById('rows');
   if(!data.length){
-    tbody.innerHTML='<tr><td colspan="7" class="empty">No monitors yet — add one below.</td></tr>';
+    tbody.innerHTML='<tr><td colspan="9" class="empty">No monitors yet — add one below.</td></tr>';
   } else {
     tbody.innerHTML=data.map(renderRow).join('');
   }
@@ -641,23 +793,34 @@ document.getElementById('addBtn').addEventListener('click',async()=>{
   const name=document.getElementById('newName').value.trim();
   const url=document.getElementById('newUrl').value.trim();
   const interval=parseInt(document.getElementById('newInterval').value);
+  const type=document.getElementById('newType').value;
+  const secretType=document.getElementById('newSecretType').value;
+  const secret=secretType==='custom'?document.getElementById('newSecret').value.trim():secretType;
   const errEl=document.getElementById('addErr');
   errEl.style.display='none';
   if(!name||!url){errEl.textContent='Name and URL are required';errEl.style.display='block';return;}
   const btn=document.getElementById('addBtn');
   btn.disabled=true;
-  const r=await fetch('/api/monitors',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,url,interval})});
+  const r=await fetch('/api/monitors',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,url,interval,type,secret})});
   btn.disabled=false;
   if(r.ok){
     document.getElementById('newName').value='';
     document.getElementById('newUrl').value='';
     document.getElementById('newInterval').value='60';
+    document.getElementById('newType').value='simple';
+    document.getElementById('newSecretType').value='';
+    document.getElementById('newSecret').value='';
+    document.getElementById('newSecret').style.display='none';
     load();
   } else {
     const d=await r.json().catch(()=>({}));
     errEl.textContent=d.error||'Failed to add monitor';
     errEl.style.display='block';
   }
+});
+
+document.getElementById('newSecretType').addEventListener('change',function(){
+  document.getElementById('newSecret').style.display=this.value==='custom'?'':'none';
 });
 
 load();
