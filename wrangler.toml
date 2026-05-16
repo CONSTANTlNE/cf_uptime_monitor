@@ -1,0 +1,17 @@
+name = "uptime-monitor"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[triggers]
+# CF cron minimum granularity is 1 minute.
+# Sub-minute intervals (e.g. 30s) are stored per-monitor but actual
+# check frequency is capped at ~60s by this cron. See README for details.
+crons = ["* * * * *"]
+
+[[kv_namespaces]]
+binding = "KV"
+id = "96b90660c75c4ecb992fc4aa0b830365"
+
+# Secrets — set via `wrangler secret put`, NOT stored here:
+#   wrangler secret put ADMIN_PASSWORD
+#   wrangler secret put SECRET_KEY
