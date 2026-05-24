@@ -2,6 +2,15 @@ name = "uptime-monitor"
 main = "src/index.js"
 compatibility_date = "2024-01-01"
 
+# Route + flags — declared here to match remote exactly so wrangler deploy
+# does not override Dashboard settings on every push.
+workers_dev = true
+preview_urls = true
+
+routes = [
+  { pattern = "uptime.ews.ge", zone_name = "ews.ge", custom_domain = true }
+]
+
 [triggers]
 # CF cron minimum granularity is 1 minute.
 # Sub-minute intervals (e.g. 30s) are stored per-monitor but actual

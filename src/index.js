@@ -161,56 +161,13 @@ async function runChecks(env) {
       // Skip if checked more recently than the monitor's interval
       if (now - (prevStatus?.lastCheck ?? 0) < monitor.interval * 1000) return;
 
-      // Append secret as query param if configured.
-      // '__bot_token__' is a special marker — resolved from KV at runtime so
-      // the token value is never stored in the monitor object itself.
-      let fetchUrl = monitor.url;
-      if (monitor.secret) {
-        try {
-          let secretValue = monitor.secret;
-          if (secretValue === '__bot_token__') {
-            const tgConfig = await getTelegramConfig(env.KV);
-            secretValue = tgConfig?.botToken ?? '';
-          }
-          if (secretValue) {
-            const u = new URL(monitor.url);
-            u.searchParams.set('secret', secretValue);
-            fetchUrl = u.toString();
-          }
-        } catch { /* malformed URL, use as-is */ }
-      }
-
-      const start = Date.now();
-      let newStatusVal = 'down';
-      let responseTime = 0;
-      let checkResults = null;
-
-      try {
-        const res = await fetch(fetchUrl, {
-          signal: AbortSignal.timeout(10_000),
-          redirect: 'follow',
-          headers: { 'User-Agent': 'UptimeMonitor/1.0' },
-        });
-        responseTime = Date.now() - start;
-        if (res.status >= 400) {
-          newStatusVal = 'down';
-        } else if (monitor.type === 'custom') {
-          try {
-            const body = await res.json();
-            checkResults = parseHealthJson(body);
-            const hasFail = body.status === 'fail' ||
-              Object.values(checkResults).some(c => c.state === 'fail');
-            newStatusVal = hasFail ? 'down' : 'up';
-          } catch {
-            newStatusVal = 'up'; // HTTP ok but not JSON — treat as simple up
-          }
-        } else {
-          newStatusVal = 'up';
-        }
-      } catch {
-        responseTime = Date.now() - start;
-        newStatusVal = 'down';
-      }
+      const {
+        status: newStatusVal,
+        responseTime,
+        checkResults,
+        httpStatus: newHttpStatus,
+        error: fetchError,
+      } = await performCheck(monitor, env);
 
       const prevStatusVal = prevStatus?.status;
       const statusChanged = prevStatusVal && prevStatusVal !== 'paused' && prevStatusVal !== newStatusVal;
@@ -238,6 +195,8 @@ async function runChecks(env) {
         since,
         lastCheck: now,
         lastResponseTime: responseTime,
+        ...(newHttpStatus  ? { lastHttpStatus: newHttpStatus }  : {}),
+        ...(fetchError     ? { lastError: fetchError }          : {}),
         alertCount: newAlertCount,
         lastAlertAt: shouldAlert ? now : prevLastAlertAt,
         ...(checkResults ? { checks: checkResults } : {}),
@@ -256,29 +215,53 @@ async function runChecks(env) {
         const config = await getTelegramConfig(env.KV);
         if (config?.botToken && config.chatIds.length) {
           const utc = new Date(now).toUTCString();
+          // Use the freshest check details; fall back to last known for reminders
           const checks = checkResults ?? prevStatus?.checks ?? null;
           let msg;
 
+          function fmtChecks(c) {
+            if (!c || !Object.keys(c).length) return '';
+            return '\n\n' + Object.entries(c).map(([k, v]) => {
+              const icon = v.state === 'ok' ? '✅' : v.state === 'warn' ? '⚠️' : '❌';
+              return `${icon} ${k}${v.detail ? ' · ' + v.detail : ''}`;
+            }).join('\n');
+          }
+
           if (statusChanged && newStatusVal === 'down') {
-            msg = `🔴 ${monitor.name} is DOWN\n${monitor.url}\nAt: ${utc}`;
+            if (fetchError) {
+              // Network-level failure — server never answered
+              msg = `🔴 ${monitor.name} — UNREACHABLE\n${monitor.url}\n⚠️ ${fetchError}\nAt: ${utc}`;
+            } else if (checks && Object.values(checks).some(c => c.state === 'fail')) {
+              // HTTP ok but health checks report failure
+              msg = `🔴 ${monitor.name} — HEALTH CHECK FAILED\n${monitor.url}\nAt: ${utc}`;
+            } else {
+              // Plain HTTP error (4xx/5xx)
+              const httpInfo = newHttpStatus ? ` (HTTP ${newHttpStatus})` : '';
+              msg = `🔴 ${monitor.name} is DOWN${httpInfo}\n${monitor.url}\nAt: ${utc}`;
+            }
+            msg += fmtChecks(checks);
+
           } else if (stillDownReminder) {
             const sec = Math.floor((now - since) / 1000);
             const m = Math.floor(sec / 60);
             const s = sec % 60;
-            msg = `🔴 ${monitor.name} is STILL DOWN (${newAlertCount}/5)\n${monitor.url}\nDown for: ${m}m ${s}s`;
+            // Re-use stored error/http from last check so reminders carry same context
+            const remErr  = fetchError  ?? prevStatus?.lastError      ?? null;
+            const remHttp = newHttpStatus ?? prevStatus?.lastHttpStatus ?? null;
+            if (remErr) {
+              msg = `🔴 ${monitor.name} — STILL UNREACHABLE (${newAlertCount}/5)\n${monitor.url}\n⚠️ ${remErr}\nDown for: ${m}m ${s}s`;
+            } else {
+              const httpInfo = remHttp ? ` (HTTP ${remHttp})` : '';
+              msg = `🔴 ${monitor.name} STILL DOWN${httpInfo} (${newAlertCount}/5)\n${monitor.url}\nDown for: ${m}m ${s}s`;
+            }
+            msg += fmtChecks(checks);
+
           } else {
             // Recovery
             const sec = Math.floor((now - (prevStatus?.since ?? now)) / 1000);
             const m = Math.floor(sec / 60);
             const s = sec % 60;
             msg = `🟢 ${monitor.name} recovered\n${monitor.url}\nDowntime: ${m}m ${s}s`;
-          }
-
-          if (checks && Object.keys(checks).length) {
-            msg += '\n\n' + Object.entries(checks).map(([k, v]) => {
-              const icon = v.state === 'ok' ? '✅' : v.state === 'warn' ? '⚠️' : '❌';
-              return `${icon} ${k}${v.detail ? ' · ' + v.detail : ''}`;
-            }).join('\n');
           }
 
           await sendTelegramMessage(config, msg);
@@ -467,6 +450,120 @@ async function apiTestTelegram(env) {
   return json({ ok: true });
 }
 
+// ─── Manual Check ────────────────────────────────────────────────────────────
+
+async function performCheck(monitor, env) {
+  // Resolve URL with secret if configured
+  let fetchUrl = monitor.url;
+  if (monitor.secret) {
+    try {
+      let secretValue = monitor.secret;
+      if (secretValue === '__bot_token__') {
+        const tgConfig = await getTelegramConfig(env.KV);
+        secretValue = tgConfig?.botToken ?? '';
+      }
+      if (secretValue) {
+        const u = new URL(monitor.url);
+        u.searchParams.set('secret', secretValue);
+        fetchUrl = u.toString();
+      }
+    } catch { /* malformed URL, use as-is */ }
+  }
+
+  const start = Date.now();
+  let status = 'down';
+  let responseTime = 0;
+  let checkResults = null;
+  let httpStatus = null;
+  let error = null;
+
+  let rawBody = null;
+
+  try {
+    const res = await fetch(fetchUrl, {
+      signal: AbortSignal.timeout(10_000),
+      redirect: 'follow',
+      headers: { 'User-Agent': 'UptimeMonitor/1.0' },
+    });
+    responseTime = Date.now() - start;
+    httpStatus = res.status;
+    if (res.status >= 400) {
+      status = 'down';
+      // Capture body so the caller can surface the error detail.
+      // For custom monitors also try to extract check results from the body —
+      // some apps return health JSON even on a 500.
+      try {
+        const text = await res.text();
+        if (text) {
+          try {
+            rawBody = JSON.parse(text);
+            if (monitor.type === 'custom') {
+              try { checkResults = parseHealthJson(rawBody); } catch { /* not health JSON */ }
+            }
+          } catch {
+            rawBody = text.slice(0, 2000);
+          }
+        }
+      } catch { /* ignore read errors */ }
+    } else if (monitor.type === 'custom') {
+      try {
+        const body = await res.json();
+        rawBody = body;
+        checkResults = parseHealthJson(body);
+        const hasFail = body.status === 'fail' ||
+          Object.values(checkResults).some(c => c.state === 'fail');
+        status = hasFail ? 'down' : 'up';
+      } catch {
+        status = 'up'; // HTTP ok but not JSON — treat as simple up
+      }
+    } else {
+      status = 'up';
+    }
+  } catch (err) {
+    responseTime = Date.now() - start;
+    status = 'down';
+    error = String(err?.message || 'Request failed');
+  }
+
+  return { status, responseTime, httpStatus, checkResults, rawBody, error };
+}
+
+async function apiCheckMonitor(id, env) {
+  const monitor = await getMonitor(env.KV, id);
+  if (!monitor) return json({ error: 'Not found' }, 404);
+
+  const result = await performCheck(monitor, env);
+  const now = Date.now();
+
+  // Update KV with the fresh result (no Telegram alerts for manual checks)
+  const prevStatus = await getStatus(env.KV, id);
+  const prevStatusVal = prevStatus?.status;
+  const since = (prevStatusVal && prevStatusVal !== 'paused' && prevStatusVal !== result.status)
+    ? now
+    : (prevStatus?.since ?? now);
+
+  const newStatusObj = {
+    status: result.status,
+    since,
+    lastCheck: now,
+    lastResponseTime: result.responseTime,
+    alertCount: prevStatus?.alertCount ?? 0,
+    lastAlertAt: prevStatus?.lastAlertAt ?? 0,
+    ...(result.checkResults ? { checks: result.checkResults } : {}),
+  };
+
+  const history = await getHistory(env.KV, id);
+  history.push({ t: now, ms: result.responseTime, status: result.status });
+  if (history.length > 24) history.shift();
+
+  await Promise.all([
+    env.KV.put(`status:${id}`, JSON.stringify(newStatusObj)),
+    env.KV.put(`history:${id}`, JSON.stringify(history)),
+  ]);
+
+  return json({ ...result, id, updatedAt: now });
+}
+
 // ─── CSS ─────────────────────────────────────────────────────────────────────
 
 const CSS = `
@@ -531,6 +628,16 @@ tr:hover td{background:var(--surface2)}
 .chk-fail{background:#ef444418;color:#ef4444}
 .chk-warn{background:#eab30818;color:#d97706}
 .chk-unknown{background:#77777718;color:#888}
+.btn-check{background:#3b82f618;color:var(--blue);border:1px solid #3b82f630;padding:4px 10px;font-size:12px}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:100}
+.modal-overlay.open{display:flex}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px;width:400px;max-width:calc(100vw - 32px)}
+.modal-title{font-size:15px;font-weight:600;margin-bottom:16px}
+.modal-row{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-size:13px}
+.modal-lbl{color:var(--muted);min-width:90px;flex-shrink:0}
+.modal-footer{margin-top:18px;text-align:right}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .6s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
 @media(max-width:640px){
   .wrap{padding:16px 12px}
   .hdr{padding:10px 14px}
@@ -638,7 +745,7 @@ function dashboardPage() {
           <th>Response</th>
           <th style="width:88px">Last 24</th>
           <th>Checked</th>
-          <th style="width:160px"></th>
+          <th style="width:210px"></th>
         </tr>
       </thead>
       <tbody id="rows">
@@ -685,6 +792,14 @@ function dashboardPage() {
     </div>
   </div>
 </main>
+
+<div class="modal-overlay" id="checkModal">
+  <div class="modal-box">
+    <div class="modal-title" id="modalTitle">Check Result</div>
+    <div id="modalContent"></div>
+    <div class="modal-footer"><button class="btn-ghost" id="modalClose">Close</button></div>
+  </div>
+</div>
 
 <script>
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
@@ -746,6 +861,7 @@ function renderRow(m){
     '<td>'+sparkline(m.history)+'</td>'+
     '<td style="color:var(--muted);font-size:12px;white-space:nowrap">'+relTime(m.lastCheck)+'</td>'+
     '<td><div class="acts">'+
+      '<button class="btn-check btn-sm btn-check-now" data-id="'+m.id+'" data-name="'+esc(m.name)+'">Check</button>'+
       '<button class="btn-ghost btn-sm btn-toggle" data-id="'+m.id+'" data-enabled="'+(m.enabled?'1':'0')+'">'+toggleLabel+'</button>'+
       '<button class="btn-danger btn-delete" data-id="'+m.id+'" data-name="'+esc(m.name)+'">Delete</button>'+
     '</div></td>'+
@@ -762,6 +878,9 @@ async function load(){
   } else {
     tbody.innerHTML=data.map(renderRow).join('');
   }
+  tbody.querySelectorAll('.btn-check-now').forEach(b=>{
+    b.addEventListener('click',()=>checkMonitor(b.dataset.id, b.dataset.name));
+  });
   tbody.querySelectorAll('.btn-toggle').forEach(b=>{
     b.addEventListener('click',()=>toggle(b.dataset.id, b.dataset.enabled!=='1'));
   });
@@ -822,6 +941,51 @@ document.getElementById('addBtn').addEventListener('click',async()=>{
 document.getElementById('newSecretType').addEventListener('change',function(){
   document.getElementById('newSecret').style.display=this.value==='custom'?'':'none';
 });
+
+// ── Manual Check Modal ──
+const checkModal=document.getElementById('checkModal');
+document.getElementById('modalClose').addEventListener('click',()=>checkModal.classList.remove('open'));
+checkModal.addEventListener('click',e=>{if(e.target===checkModal)checkModal.classList.remove('open');});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')checkModal.classList.remove('open');});
+
+async function checkMonitor(id,name){
+  const mTitle=document.getElementById('modalTitle');
+  const mContent=document.getElementById('modalContent');
+  mTitle.textContent='Checking…';
+  mContent.innerHTML='<div style="padding:12px 0;display:flex;align-items:center;gap:10px;color:var(--muted)"><span class="spin"></span>Sending request to server…</div>';
+  checkModal.classList.add('open');
+
+  const r=await fetch('/api/monitors/'+id+'/check',{method:'POST'}).catch(()=>null);
+  if(!r){
+    mTitle.textContent='Check failed';
+    mContent.innerHTML='<div style="color:var(--red);font-size:13px">Network error — could not reach the worker.</div>';
+    return;
+  }
+  const d=await r.json().catch(()=>({}));
+  mTitle.textContent='Result · '+esc(name);
+
+  const st=d.status||'unknown';
+  let out='';
+  out+='<div class="modal-row"><span class="modal-lbl">Status</span><span class="badge '+st+'"><span class="dot"></span><span class="lbl2">'+(st.charAt(0).toUpperCase()+st.slice(1))+'</span></span></div>';
+  if(d.httpStatus!=null)out+='<div class="modal-row"><span class="modal-lbl">HTTP status</span><span>'+d.httpStatus+'</span></div>';
+  out+='<div class="modal-row"><span class="modal-lbl">Response time</span><span>'+(d.responseTime||0)+'ms</span></div>';
+  if(d.error)out+='<div class="modal-row"><span class="modal-lbl">Error</span><span style="color:var(--red);word-break:break-all">'+esc(d.error)+'</span></div>';
+  if(d.checkResults&&Object.keys(d.checkResults).length){
+    out+='<div style="margin-top:14px;font-size:12px;color:var(--muted);margin-bottom:7px;text-transform:uppercase;letter-spacing:.5px">Health checks</div>';
+    out+='<div class="checks">'+Object.entries(d.checkResults).map(([k,v])=>{
+      const icon=v.state==='ok'?'✅':v.state==='warn'?'⚠️':'❌';
+      const detail=v.detail?' · '+esc(v.detail):'';
+      return'<span class="chk chk-'+esc(v.state)+'">'+icon+' '+esc(k)+detail+'</span>';
+    }).join('')+'</div>';
+  }
+  if(d.rawBody!=null){
+    const pretty=typeof d.rawBody==='string'?d.rawBody:JSON.stringify(d.rawBody,null,2);
+    out+='<div style="margin-top:14px;font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px">Response body</div>';
+    out+='<pre style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px;font-size:11px;overflow:auto;max-height:220px;white-space:pre-wrap;word-break:break-all;color:var(--text)">'+esc(pretty)+'</pre>';
+  }
+  mContent.innerHTML=out;
+  load(); // refresh table with updated status
+}
 
 load();
 setInterval(load,30000);
@@ -962,6 +1126,9 @@ async function handleRequest(request, env) {
   if (path === '/api/status' && method === 'GET') return apiGetStatus(env);
   if (path === '/api/settings/telegram' && method === 'POST') return apiSaveTelegram(request, env);
   if (path === '/api/settings/telegram/test' && method === 'POST') return apiTestTelegram(env);
+
+  const mCheck = path.match(/^\/api\/monitors\/([^/]+)\/check$/);
+  if (mCheck && method === 'POST') return apiCheckMonitor(mCheck[1], env);
 
   const m = path.match(/^\/api\/monitors\/([^/]+)$/);
   if (m) {
